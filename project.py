@@ -10,7 +10,7 @@ import shutil
 import fiona
 from fiona.crs import from_epsg
 from pyproj import Transformer, CRS
-import requests
+import urllib.request
 import geojson
 from geojson import FeatureCollection
 from shapely.geometry import shape, mapping
@@ -25,26 +25,36 @@ from osgeo import gdal
 from osgeo import ogr
 from osgeo import osr
 
+from rasterstats import zonal_stats
+
 # General workflow
 
-# Create output folder
+# Create output and temporary folders
+# Reproject CAOP into WGS 84, which is the coordinate system of ipma's data
 # Dissolve CAOP into counties
 # Obtain IPMA's data
 # Save to the database
 # Remove stations data outside the boundary of Portugal Continental
 # Interpolate to get data on counties with no data
 # Create a raster of the interpolation and clip it to the boundary of Portugal Continental
+# Create a choropleth map
 
-def create_folder(path):
-    # Always recreate the folder, even if it existed previously
-    if os.path.exists(path):
-        shutil.rmtree(path)
-    os.mkdir(path)
-    print("\t Folder created: {0}".format(path))
+def create_folders(paths):
+    # Always recreate the folders, even if it existed previously
+    for path in paths:
+        if os.path.exists(path):
+            shutil.rmtree(path)
+        os.mkdir(path)
+        print("\t Folder created: {0}".format(path))
+    
+def delete_folders(paths):
+    for path in paths:
+        if os.path.exists(path):
+            shutil.rmtree(path)
 
 def reproject(infile, outfile, epsg):
     # Only reproject if the reprojected file does not exist.
-    # This is an exception because it's still an input data, not an output and will never change.
+    # This is an exception because it's still an input data, not an output and will probably never change.
     # As such, speeds up the processing time.
     if os.path.exists(outfile):
         print ("\t Reprojection not needed. Skipping step.")
@@ -61,7 +71,7 @@ def reproject(infile, outfile, epsg):
                 for feature in input:
                     new_coords = []
                     for coordinate in feature['geometry']['coordinates']:
-                        x2, y2 = transformer.transform(*zip(*coordinate))
+                        x2, y2 = transformer.transform(*zip(*coordinate)) # Swap the coordinates. EPSG 4326 uses lon / lat, not lat / lon
                         new_coords.append(zip(y2, x2))
                     feature['geometry']['coordinates'] = new_coords
                     output.write(feature)
@@ -69,11 +79,12 @@ def reproject(infile, outfile, epsg):
         print("\t Reprojection failed, cleanup any created files.")
 
 # Implementation of the dissolve inspired by the dissolve in ArcGIS
-# If no fields are specified, it will dissolve every geometry and keep only the boundary
+# If no fields are specified, it will dissolve every geometry. Useful to have a country boundary.
 # Else it will dissolve by the parametres specified
 # This solution was inspired by an answer on the GIS StackExchange: https://gis.stackexchange.com/a/274516
-def dissolve(infile, outfile, fields=[]):
-    print('\t Start dissolve geoprocessing on {0}...'.format(infile))
+# It will group every item in 
+def dissolve(infile, outfile, fields=[], print_tab_count = 1):
+    print('{0} Start dissolve geoprocessing on {1}...'.format('\t' * print_tab_count, infile))
     with fiona.open(infile) as input:
         with fiona.open(outfile, 'w', **input.meta) as output:
             if (len(fields) != 0):
@@ -85,11 +96,12 @@ def dissolve(infile, outfile, fields=[]):
             else:
                 properties, geom = zip(*[(feature['properties'], shape(feature['geometry'])) for feature in input])
                 output.write({'geometry': mapping(unary_union(geom)), 'properties': properties[0]})
-    print('\t Finished dissolve geoprocessing. File: {0}'.format(outfile))
+    print('{0} Finished dissolve geoprocessing. File: {1}'.format('\t' * print_tab_count, outfile))
 
 def save_observation_data(data):
     # https://www.psycopg.org/docs/usage.html
     # Connect to the postgres DB and open a cursor to perform operations
+    # Password hardcoded, but it was kept simple as this script is not meant for production release.
     with psycopg2.connect('dbname=geoprog user=postgres password=b') as conn:
         with conn.cursor() as cur:
             # Execute queries
@@ -100,19 +112,27 @@ def save_observation_data(data):
                     cur.execute("""INSERT INTO main.stationdata (geom, intensidadeVentoKM, temperatura, idEstacao, pressao, humidade, localEstacao, precAcumulada, idDireccVento, radiacao, time, intensidadeVento, descDirVento)
                                 VALUES (ST_GeomFromGeoJSON(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);"""
                                 , (geom, properties['intensidadeVentoKM'], properties['temperatura'], properties['idEstacao'], properties['pressao'], properties['humidade'], properties['localEstacao'],properties['precAcumulada'],properties['idDireccVento'],properties['radiacao'],properties['time'], properties['intensidadeVento'], properties['descDirVento']))
-                except psycopg2.errors.UniqueViolation as e:
-                    continue # Ignore this error, happens many times in tests and should never happen with ipma's own data. 
+                except psycopg2.errors.UniqueViolation:
+                    # Ignore this error, happens many times in tests. 
+                    # Should never happen with IPMA's own data because the script should run every X hours on a schedule.
+                    # In any case, if it happens, it's covered here and the data won't be inserted again.
+                    continue 
                 finally:
                     # Make the changes to the database permanent, close the transaction
                     conn.commit()            
 
 def import_ipma_data():
+    # This function fully utilizes GDAL instead of fiona and shapely
+    # as it is very efficient to clip station data and will be used to generate
+    # the interpolation and then also to clip the interpolation raster.
+    # GDAL itself was already installed by fiona, so it's not an extra library.
+
     print("\t Importing data from the last 3 hours from IPMA's API ...")
     
     # First obtain the data
     url = 'https://api.ipma.pt/open-data/observation/meteorology/stations/obs-surface.geojson'
-    r = requests.get(url)
-    observation_data = geojson.loads(r.content)
+    r = urllib.request.urlopen(url)
+    observation_data = geojson.loads(r.read())
 
     # Save data to the database
     print ("\t Saving data to the database ...")
@@ -120,29 +140,18 @@ def import_ipma_data():
 
     print("\t Import finished")
 
-def shp_to_geojson(shp):
-    with fiona.open(shp) as file:
-        if CRS.from_string(file.crs_wkt) != CRS.from_epsg(4326):
-            print ("{0} is not in EPSG 4326 as mandated by RFC 7946. Please project it first.".format(shp))
-            return
-
-        features = [feature for feature in file]
-
-    return FeatureCollection(features)
-
-def interpolate_temperature(shapefile, output_path):
+def interpolate_temperature(shapefile, output_path, tmp_path):
 
     print ("\t Start interpolation process:")
     # First, let's create a boundary of Portugal Continental
     print("\t\t Creating boundary of Portugal Continental...")
     boundary_file = os.path.join(output_path, "boundary_portugal_continental.shp")
-    dissolve(shapefile, boundary_file)
+    dissolve(shapefile, boundary_file, print_tab_count = 2)
     
     driver = ogr.GetDriverByName("ESRI Shapefile")
     dataSource = driver.Open(boundary_file, 0)
     shpLyr = dataSource.GetLayer()
-    boundary = None
-    bounds = None
+
     for feature in shpLyr:
         boundary = feature.GetGeometryRef()
         bounds = boundary.GetEnvelope()
@@ -197,37 +206,66 @@ def interpolate_temperature(shapefile, output_path):
         feature = None
 
     data_source = None
+    conn = None
 
-    idw_file = os.path.join(output_path, "invdist.tif") 
-    print ("\t\t Shapefile generated, interpolating temperature with Inverse Distance Weighted (IDW)")
-    
-    # [minx, miny, maxx, maxy]
+    print ("\t\t Shapefile generated, interpolating temperature with Inverse Distance Weighted (IDW)...")
+
+    # The bounds used by gdal grid function have a different ordering from the envelope given by gdal itself. 
+    # outputBounds have the following order [minx, miny, maxx, maxy], gdal's envelope is [minx, maxx, miny, maxy]
     bounds_corrected = [bounds[0], bounds[2], bounds[1], bounds[3]]
     
+    # Create an interpolation with IDW and save an uncliped file to the tmp folder.
+    idw_file = os.path.join(tmp_path, "invdist.tif") 
     gdal.Grid(idw_file, stations_shapefile, zfield="Temp", algorithm = "invdist", outputBounds=bounds_corrected, width=800, height = 800)
 
-    print ("\t\t Clipping raster to the boundary of Portugal Continental.")
+    print ("\t\t Clipping raster to the boundary of Portugal Continental...")
+    idw_clipped_file = os.path.join(output_path, "invdist_clip.tif")
     ds = gdal.Open(idw_file)
-    idw_clipped_file = os.path.join(output_path, "invdist_clip.tif") 
-    gdal.Warp(idw_clipped_file, ds, cutlineDSName = boundary_file, cropToCutline= True)
-    conn = None
-    
+    gdal.Warp(idw_clipped_file, ds, cutlineDSName = boundary_file, cropToCutline= True, dstNodata = "-999")
+    ds = None
+
     print ("\t Finished interpolation process.")
-    return
+    return idw_clipped_file
+
+def generate_zonal_stats(shapefile, idw, output_path):
+    print ("Calculate zonal stats to get a mean value of the temperature in every county.")
+    # Calculate zonal statistics to get the mean temperature in every Country
+    stats = zonal_stats(shapefile, idw, stats="mean", geojson_out = True, nodata = -999)
+
+    # Generate shapefile to allow for further analysis. The geojson generated by the zonal_stats is too big and slow to process on GIS tools
+    schema = {
+        'geometry': 'Polygon',
+        'properties': {
+            'meantemp': 'float'
+        }
+    }
+    zonal_stats_path = os.path.join(output_path, "zonal_stats.shp")
+    with fiona.open(zonal_stats_path, 'w', 'ESRI Shapefile', schema, from_epsg(4326)) as output:
+        for stat in stats:
+            feature = {
+                'geometry': stat['geometry'],
+                'properties': {
+                    'meantemp': stat['properties']['mean']
+                }
+            }
+            output.write(feature)
     
 def start_processing():
     BASE_PATH = os.getcwd()
     DATA_PATH = os.path.join(BASE_PATH, "dados")
     OUTPUT_PATH = os.path.join(BASE_PATH, "output")
+    TMP_PATH = os.path.join(BASE_PATH, "tmp")
     CAOP_FILE = os.path.join(DATA_PATH, 'Cont_AAD_CAOP2021', 'Cont_AAD_CAOP2021.shp')
     REPROJECTED_CAOP_FILE = os.path.join(DATA_PATH, 'Cont_AAD_CAOP2021', 'Cont_AAD_CAOP2021_Reprojected.shp')
     COUNTY_CAOP_FILE = os.path.join(OUTPUT_PATH, 'Cont_AAD_CAOP2021_Concelhos.shp')
 
-    # First create or recreate the output folder for our processed data
-    create_folder(OUTPUT_PATH)
+    # First create or recreate the output folder to store the relevant processed data
+    # Then create a temporary folder to store files that are needed for intermediate processing
+    create_folders([OUTPUT_PATH, TMP_PATH])
 
-    # This script prefers WGS 84, so first the CAOP needs to be reprojected
+    # This script prefers WGS 84, so first the CAOP needs to be reprojected from EPSG 3763 to 4326
     reproject(CAOP_FILE, REPROJECTED_CAOP_FILE, 4326)
+
     # Dissolve CAOP, remove every parish (Freguesia)
     dissolve(REPROJECTED_CAOP_FILE, COUNTY_CAOP_FILE, ['Concelho'])
 
@@ -235,7 +273,12 @@ def start_processing():
     import_ipma_data()
 
     # Interpolate temperature
-    interpolate_temperature(COUNTY_CAOP_FILE, OUTPUT_PATH)
+    temp_idw_raster = interpolate_temperature(COUNTY_CAOP_FILE, OUTPUT_PATH, TMP_PATH)
+
+    generate_zonal_stats(COUNTY_CAOP_FILE, temp_idw_raster, OUTPUT_PATH)
+
+    # Delete the tmp folder
+    delete_folders([TMP_PATH])
             
 # https://www.freecodecamp.org/news/if-name-main-python-example/
 if __name__ == '__main__':
