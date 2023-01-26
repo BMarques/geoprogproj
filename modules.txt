@@ -1,7 +1,6 @@
 fiona
 pyproj
 shapely
-requests
 geojson
 psycopg2
 rasterstats
